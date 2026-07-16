@@ -4,36 +4,72 @@
 
 A custom SignalRGB plugin for the **AsiaHorse Umbra ARGB Hub / ROBOBLOQ USBFAN controller**.
 
-This project is the result of reverse engineering the controller's proprietary HID protocol using USB traffic captured from the official AsiaHorse software. The plugin allows SignalRGB to control the lighting of each physical ARGB output independently without requiring the official AsiaHorse software to remain running.
+This project is the result of reverse engineering the controller's proprietary USB HID protocol using traffic captured from the official AsiaHorse software. The plugin allows SignalRGB to communicate directly with the controller and drive its physical ARGB outputs without requiring the official AsiaHorse software to remain running.
 
-**USB VID:** `0x1A86`
+**USB VID:** `0x1A86`  
 **USB PID:** `0xFE05`
 
-## Works without requiring the official AsiaHorse software
+## Works without the official AsiaHorse software
 
-The plugin communicates directly with the controller using its native FE05 HID protocol.
+The plugin communicates directly with the controller through the USB HID interface.
 
-The controller provides **10 physical ARGB ports**, and each port is exposed as an independent subdevice/channel inside SignalRGB.
+The controller provides **10 physical ARGB ports**, exposed as independent channels inside SignalRGB.
+
+Live SignalRGB rendering uses the controller's direct RGB streaming protocol instead of converting each port to a single representative color.
+
+## How Direct RGB Works
+
+The reverse-engineered direct RGB stream uses packets in the following format:
+
+```text
+88 [Packet Count] [Packet Index] [20 x RGB] [Checksum]
+```
+
+The current plugin configuration sends:
+
+```text
+6 packets x 20 RGB slots = 120 RGB slots per frame
+```
+
+The 10 physical ARGB ports are mapped using fixed 11-slot regions:
+
+```text
+Port 01 -> slots   0..10
+Port 02 -> slots  11..21
+Port 03 -> slots  22..32
+Port 04 -> slots  33..43
+Port 05 -> slots  44..54
+Port 06 -> slots  55..65
+Port 07 -> slots  66..76
+Port 08 -> slots  77..87
+Port 09 -> slots  88..98
+Port 10 -> slots  99..109
+Padding -> slots 110..119
+```
+
+Each SignalRGB channel is resampled into its fixed 11-slot region. This keeps every physical port aligned correctly even when the selected SignalRGB component declares a different LED count.
 
 ## ⚠️ Important Notes & Known Limitations
 
 * **10 Physical ARGB Ports:** The AsiaHorse Umbra controller has a total of 10 physical ARGB outputs.
 
-* **Ports 09 and 10 are currently unverified:** During protocol reverse engineering, only **8 ARGB ports were physically connected and captured**. Therefore, ports `01` through `08` have been confirmed from actual USB traffic.
+* **Ports 09 and 10 are still physically unverified:** During the original USB capture, only **8 ARGB ports had connected devices**. Ports `01` through `08` were therefore directly confirmed from captured traffic and real hardware behavior.
 
-  Ports `09` and `10` are implemented using the same observed protocol indexing convention and are expected to work, but they have **not yet been verified on real connected hardware**.
+  The plugin now implements all 10 ports using the same fixed 11-slot mapping and a 6-packet direct RGB frame. This configuration has been confirmed to operate correctly with the controller, but **ports `09` and `10` have still not been individually verified with real devices connected to those physical outputs**.
 
-* **Per-Port Color Control:** The captured FE05 protocol exposes a native color profile for each physical ARGB port rather than direct individual LED pixel streaming.
+* **11 Direct RGB Slots Per Port:** Each physical port occupies 11 RGB transport slots in the current mapping.
 
-  Because of this limitation, SignalRGB effects are converted into a single representative RGB color for each ARGB port. All LEDs connected to the same physical port will therefore display the same color at any given moment.
+  SignalRGB components may declare more or fewer LEDs. The plugin resamples the component's current colors into these 11 transport slots without changing the physical offset of later ports.
 
-* **Animated Effects:** Animated SignalRGB effects are supported, but each port receives one dynamically calculated representative color instead of independent per-LED colors.
+* **Direct RGB Capacity:** The plugin sends 6 packets per frame, providing 120 RGB transport slots. The 10 ports use 110 slots and the remaining 10 slots are sent as black padding.
 
-* **Official AsiaHorse Software:** It is recommended to completely close the official AsiaHorse RGB software before using this plugin to prevent both applications from attempting to communicate with the controller at the same time.
+* **Native Effects:** The FE05 native profile protocol is still available for controller-native effects and debug modes. In particular, FE05 selector `0x01` is the controller's internal Rainbow effect and is not used for live SignalRGB rendering.
+
+* **Official AsiaHorse Software:** Completely close the official AsiaHorse RGB software before using this plugin to prevent both applications from communicating with the controller at the same time.
 
 * **USB Connection:** This plugin communicates directly with the USB HID controller identified by VID `0x1A86` and PID `0xFE05`.
 
-* **Other AsiaHorse Controllers:** Compatibility with other AsiaHorse RGB controllers has not been tested. Controllers using different USB VID/PID values or different protocols are not guaranteed to work.
+* **Other AsiaHorse Controllers:** Compatibility with other AsiaHorse RGB controllers has not been tested. Devices using different VID/PID values or different protocols are not guaranteed to work.
 
 ## SignalRGB Channels
 
@@ -52,9 +88,11 @@ ARGB Port 09
 ARGB Port 10
 ```
 
-Each channel can be configured with up to **120 LEDs** inside SignalRGB.
+Each channel can be configured with a SignalRGB component containing up to **120 LEDs**.
 
-> **Note:** ARGB Port 09 and ARGB Port 10 are currently experimental and have not yet been physically verified.
+The component's colors are resampled into the fixed 11 direct RGB transport slots assigned to that physical port.
+
+> **Note:** ARGB Port 09 and ARGB Port 10 are implemented, but they have not yet been individually verified with real devices connected to those two physical outputs.
 
 ## Installation
 
@@ -88,24 +126,74 @@ AsiaHorse Umbra ARGB Hub
 
 The plugin was developed by analyzing USB HID traffic generated by the official AsiaHorse software.
 
-The captured controller uses the following packet framing:
+### Native command framing
+
+Native controller commands use the following framing:
 
 ```text
 52 42 [Length] 00 [Command Data...] [Checksum]
 ```
 
-Packets are padded to a 64-byte HID payload and sent using HID Report ID `0`.
+These packets are padded to a 64-byte HID payload and sent using HID Report ID `0`.
+
+The native command protocol is used for operations such as:
+
+* Controller initialization
+* Brightness initialization
+* Entering software control mode
+* Native FE05 per-port profiles
+* Controller-native effects
+* Native keep-alive commands
+
+### Direct RGB streaming
+
+Live SignalRGB rendering uses a separate direct RGB protocol:
+
+```text
+88 [Packet Count] [Packet Index] [20 x RGB] [Checksum]
+```
+
+The current implementation sends six packets per frame:
+
+```text
+88 06 01 ...
+88 06 02 ...
+88 06 03 ...
+88 06 04 ...
+88 06 05 ...
+88 06 06 ...
+```
+
+Each packet is 64 bytes:
+
+```text
+Byte 0     = 0x88
+Byte 1     = total packet count
+Byte 2     = 1-based packet index
+Byte 3..62 = 20 RGB values
+Byte 63    = additive checksum
+```
+
+The checksum is calculated as:
+
+```text
+sum(packet bytes before checksum) & 0xFF
+```
 
 The plugin currently implements:
 
-* Controller brightness initialization
-* Independent lighting mode initialization
-* Per-port native color profile configuration
-* Dynamic SignalRGB color conversion
-* Controller keep-alive commands
+* Direct communication with the AsiaHorse Umbra USB HID controller
 * 10 independent ARGB channels
+* Direct RGB streaming for live SignalRGB effects
+* Fixed 11-slot physical mapping per ARGB port
+* 6-packet / 120-slot direct RGB frames
+* Automatic color resampling for SignalRGB components with different LED counts
+* Controller brightness initialization
+* Software control mode initialization
+* Native FE05 profile support for debug and controller-native effects
+* Native keep-alive commands outside direct RGB streaming mode
 
-The plugin intentionally uses the native **FE05 protocol** observed from the official software and does not use unrelated protocols from other AsiaHorse controller models.
+The plugin uses only protocol behavior reverse-engineered from the AsiaHorse Umbra / ROBOBLOQ USBFAN controller and does not intentionally reuse unrelated protocols from other AsiaHorse controller models.
 
 ---
 
@@ -113,40 +201,76 @@ The plugin intentionally uses the native **FE05 protocol** observed from the off
 
 Plugin SignalRGB tùy chỉnh dành cho **hub ARGB AsiaHorse Umbra / bộ điều khiển ROBOBLOQ USBFAN**.
 
-Dự án này là kết quả của quá trình dịch ngược giao thức HID độc quyền của bộ điều khiển bằng cách phân tích dữ liệu USB được ghi lại từ phần mềm AsiaHorse chính thức. Plugin cho phép SignalRGB điều khiển độc lập màu sắc của từng cổng ARGB vật lý mà không cần phần mềm AsiaHorse chính thức phải chạy nền.
+Dự án này là kết quả của quá trình dịch ngược giao thức USB HID độc quyền của bộ điều khiển bằng cách phân tích lưu lượng USB được ghi lại từ phần mềm AsiaHorse chính thức. Plugin cho phép SignalRGB giao tiếp trực tiếp với bộ điều khiển và điều khiển các đầu ra ARGB vật lý mà không cần phần mềm AsiaHorse chính thức phải tiếp tục chạy nền.
 
-**USB VID:** `0x1A86`
+**USB VID:** `0x1A86`  
 **USB PID:** `0xFE05`
 
 ## Hoạt động mà không cần phần mềm AsiaHorse chính thức
 
-Plugin giao tiếp trực tiếp với bộ điều khiển thông qua giao thức HID FE05 gốc của thiết bị.
+Plugin giao tiếp trực tiếp với bộ điều khiển thông qua giao diện USB HID.
 
-Bộ điều khiển có tổng cộng **10 cổng ARGB vật lý**, và mỗi cổng được hiển thị dưới dạng một subdevice/channel độc lập trong SignalRGB.
+Bộ điều khiển có tổng cộng **10 cổng ARGB vật lý**, được hiển thị dưới dạng các channel độc lập trong SignalRGB.
+
+Chế độ Live của SignalRGB hiện sử dụng giao thức truyền RGB trực tiếp của bộ điều khiển thay vì chuyển toàn bộ một cổng thành một màu đại diện duy nhất.
+
+## Cơ chế Direct RGB
+
+Luồng Direct RGB đã được dịch ngược sử dụng packet có dạng:
+
+```text
+88 [Số lượng Packet] [Chỉ số Packet] [20 x RGB] [Checksum]
+```
+
+Cấu hình hiện tại của plugin gửi:
+
+```text
+6 packet x 20 RGB slot = 120 RGB slot mỗi frame
+```
+
+10 cổng ARGB vật lý được ánh xạ theo các vùng cố định gồm 11 slot:
+
+```text
+Port 01 -> slot   0..10
+Port 02 -> slot  11..21
+Port 03 -> slot  22..32
+Port 04 -> slot  33..43
+Port 05 -> slot  44..54
+Port 06 -> slot  55..65
+Port 07 -> slot  66..76
+Port 08 -> slot  77..87
+Port 09 -> slot  88..98
+Port 10 -> slot  99..109
+Padding -> slot 110..119
+```
+
+Mỗi channel SignalRGB được lấy mẫu lại để khớp với vùng 11 slot cố định của cổng vật lý tương ứng. Cách này giúp giữ chính xác vị trí của từng cổng ngay cả khi component được chọn trong SignalRGB khai báo số lượng LED khác nhau.
 
 ## ⚠️ Lưu ý Quan trọng & Các giới hạn hiện tại
 
 * **10 cổng ARGB vật lý:** Bộ điều khiển AsiaHorse Umbra có tổng cộng 10 đầu ra ARGB vật lý.
 
-* **Cổng 09 và 10 hiện chưa được kiểm chứng:** Trong quá trình dịch ngược giao thức, chỉ có **8 cổng ARGB được kết nối thiết bị thực tế và xuất hiện trong dữ liệu USB đã ghi lại**. Vì vậy, các cổng từ `01` đến `08` đã được xác nhận trực tiếp thông qua dữ liệu giao tiếp thực tế.
+* **Port 09 và Port 10 vẫn chưa được kiểm thử trực tiếp với thiết bị thực tế:** Trong lần capture USB ban đầu, chỉ có **8 cổng ARGB đang được kết nối thiết bị**. Vì vậy, các cổng từ `01` đến `08` đã được xác nhận trực tiếp từ dữ liệu USB và hành vi thực tế của phần cứng.
 
-  Hai cổng `09` và `10` hiện được triển khai dựa trên cùng quy luật đánh số cổng đã quan sát được trong giao thức. Về lý thuyết chúng có thể hoạt động bình thường, nhưng **hiện tại vẫn chưa được kiểm chứng với thiết bị thực tế được kết nối vào hai cổng này**.
+  Plugin hiện đã triển khai đủ 10 cổng bằng cách sử dụng mapping cố định 11 slot cho mỗi cổng và frame Direct RGB gồm 6 packet. Cấu hình này đã được xác nhận là bộ điều khiển vẫn chấp nhận và hoạt động bình thường, tuy nhiên **Port `09` và Port `10` vẫn chưa được kiểm thử riêng với thiết bị thực tế được cắm trực tiếp vào hai đầu ra vật lý này**.
 
-* **Điều khiển màu theo từng cổng:** Giao thức FE05 được ghi lại từ phần mềm chính thức sử dụng profile màu riêng cho từng cổng ARGB vật lý thay vì cho phép truyền trực tiếp màu của từng LED riêng lẻ.
+* **11 Direct RGB slot cho mỗi cổng:** Mỗi cổng vật lý chiếm 11 RGB transport slot trong mapping hiện tại.
 
-  Vì giới hạn này, các hiệu ứng của SignalRGB sẽ được chuyển đổi thành một màu RGB đại diện cho từng cổng ARGB. Do đó, tất cả LED được kết nối vào cùng một cổng vật lý sẽ hiển thị cùng một màu tại một thời điểm.
+  Component trong SignalRGB có thể khai báo nhiều hoặc ít LED hơn. Plugin sẽ lấy mẫu lại màu hiện tại của component về 11 transport slot mà không làm thay đổi offset vật lý của các cổng phía sau.
 
-* **Hiệu ứng động:** Các hiệu ứng động của SignalRGB vẫn hoạt động, tuy nhiên mỗi cổng chỉ nhận một màu đại diện được tính toán liên tục thay vì điều khiển độc lập từng LED.
+* **Dung lượng Direct RGB:** Plugin gửi 6 packet cho mỗi frame, cung cấp tổng cộng 120 RGB transport slot. 10 cổng sử dụng 110 slot và 10 slot cuối được gửi dưới dạng màu đen để làm padding.
 
-* **Phần mềm AsiaHorse chính thức:** Nên tắt hoàn toàn phần mềm điều khiển RGB chính thức của AsiaHorse trước khi sử dụng plugin để tránh việc hai ứng dụng cùng lúc gửi lệnh đến bộ điều khiển.
+* **Hiệu ứng native:** Giao thức profile FE05 vẫn được sử dụng cho các hiệu ứng native và chế độ debug của bộ điều khiển. Cụ thể, FE05 selector `0x01` là hiệu ứng Rainbow nội bộ của controller và không được sử dụng cho chế độ Live của SignalRGB.
 
-* **Kết nối USB:** Plugin giao tiếp trực tiếp với thiết bị HID có VID `0x1A86` và PID `0xFE05`.
+* **Phần mềm AsiaHorse chính thức:** Nên tắt hoàn toàn phần mềm điều khiển RGB chính thức của AsiaHorse trước khi sử dụng plugin để tránh việc hai ứng dụng cùng lúc giao tiếp với bộ điều khiển.
+
+* **Kết nối USB:** Plugin giao tiếp trực tiếp với thiết bị USB HID có VID `0x1A86` và PID `0xFE05`.
 
 * **Các bộ điều khiển AsiaHorse khác:** Khả năng tương thích với các bộ điều khiển RGB AsiaHorse khác chưa được kiểm tra. Những thiết bị sử dụng VID/PID hoặc giao thức khác không được đảm bảo sẽ hoạt động với plugin này.
 
 ## Các Channel trong SignalRGB
 
-Plugin cung cấp 10 kênh ARGB độc lập:
+Plugin cung cấp 10 channel ARGB độc lập:
 
 ```text
 ARGB Port 01
@@ -161,9 +285,11 @@ ARGB Port 09
 ARGB Port 10
 ```
 
-Mỗi channel có thể được cấu hình tối đa **120 LED** trong SignalRGB.
+Mỗi channel có thể được cấu hình bằng một component SignalRGB có tối đa **120 LED**.
 
-> **Lưu ý:** ARGB Port 09 và ARGB Port 10 hiện vẫn mang tính thử nghiệm và chưa được kiểm chứng trực tiếp với thiết bị thực tế.
+Màu của component sẽ được lấy mẫu lại về 11 Direct RGB transport slot cố định dành cho cổng vật lý tương ứng.
+
+> **Lưu ý:** ARGB Port 09 và ARGB Port 10 đã được triển khai trong plugin, nhưng vẫn chưa được kiểm thử riêng với thiết bị thực tế được kết nối trực tiếp vào hai cổng vật lý này.
 
 ## Hướng dẫn Cài đặt
 
@@ -197,21 +323,71 @@ AsiaHorse Umbra ARGB Hub
 
 Plugin được phát triển bằng cách phân tích dữ liệu giao tiếp USB HID được tạo ra bởi phần mềm AsiaHorse chính thức.
 
-Bộ điều khiển sử dụng cấu trúc packet được quan sát như sau:
+### Cấu trúc lệnh native
+
+Các lệnh native của bộ điều khiển sử dụng cấu trúc:
 
 ```text
 52 42 [Length] 00 [Command Data...] [Checksum]
 ```
 
-Packet được bổ sung dữ liệu đệm để đạt kích thước HID payload 64 byte và được gửi với HID Report ID `0`.
+Các packet này được bổ sung dữ liệu đệm để đạt kích thước HID payload 64 byte và được gửi với HID Report ID `0`.
+
+Giao thức native được sử dụng cho các thao tác như:
+
+* Khởi tạo bộ điều khiển
+* Khởi tạo độ sáng
+* Kích hoạt chế độ điều khiển bằng phần mềm
+* Profile FE05 riêng cho từng cổng
+* Các hiệu ứng native của bộ điều khiển
+* Lệnh keep-alive native
+
+### Direct RGB streaming
+
+Chế độ Live của SignalRGB sử dụng một giao thức Direct RGB riêng:
+
+```text
+88 [Số lượng Packet] [Chỉ số Packet] [20 x RGB] [Checksum]
+```
+
+Implementation hiện tại gửi 6 packet cho mỗi frame:
+
+```text
+88 06 01 ...
+88 06 02 ...
+88 06 03 ...
+88 06 04 ...
+88 06 05 ...
+88 06 06 ...
+```
+
+Mỗi packet có kích thước 64 byte:
+
+```text
+Byte 0     = 0x88
+Byte 1     = tổng số packet
+Byte 2     = chỉ số packet bắt đầu từ 1
+Byte 3..62 = 20 giá trị RGB
+Byte 63    = additive checksum
+```
+
+Checksum được tính theo công thức:
+
+```text
+sum(các byte trước checksum) & 0xFF
+```
 
 Plugin hiện triển khai:
 
-* Khởi tạo độ sáng bộ điều khiển
-* Kích hoạt chế độ điều khiển ánh sáng độc lập
-* Thiết lập profile màu riêng cho từng cổng
-* Chuyển đổi màu động từ SignalRGB
-* Gửi lệnh keep-alive đến bộ điều khiển
+* Giao tiếp trực tiếp với bộ điều khiển USB HID AsiaHorse Umbra
 * 10 channel ARGB độc lập
+* Direct RGB streaming cho hiệu ứng Live của SignalRGB
+* Mapping vật lý cố định 11 slot cho mỗi cổng ARGB
+* Frame Direct RGB gồm 6 packet / 120 slot
+* Tự động lấy mẫu lại màu cho các component SignalRGB có số lượng LED khác nhau
+* Khởi tạo độ sáng bộ điều khiển
+* Kích hoạt chế độ điều khiển bằng phần mềm
+* Hỗ trợ profile FE05 cho debug và hiệu ứng native
+* Gửi keep-alive native khi không ở chế độ Direct RGB streaming
 
-Plugin sử dụng trực tiếp giao thức **FE05** được ghi nhận từ phần mềm AsiaHorse chính thức và không sử dụng các giao thức không liên quan của những mẫu bộ điều khiển AsiaHorse khác.
+Plugin chỉ sử dụng các hành vi giao thức được dịch ngược từ bộ điều khiển AsiaHorse Umbra / ROBOBLOQ USBFAN và không chủ ý sử dụng các giao thức không liên quan từ những mẫu bộ điều khiển AsiaHorse khác.
