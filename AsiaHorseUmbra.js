@@ -120,9 +120,15 @@ function setupChannels() {
     device.SetLedLimit(DEVICE_LED_LIMIT);
 
     // Remove channels left behind by hot-reloading older plugin versions.
-    for (let i = 1; i <= 10; i++) {
+    for (let i = 1; i <= CHANNEL_COUNT; i++) {
         const oldName = "ARGB Port " + i;
         const newName = "ARGB Port " + String(i).padStart(2, "0");
+
+        try {
+            device.removeChannel(oldName);
+        } catch (e) {
+            // Ignore channels that do not exist.
+        }
 
         try {
             device.removeChannel(newName);
