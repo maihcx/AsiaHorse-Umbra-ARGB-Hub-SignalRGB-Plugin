@@ -27,7 +27,7 @@ export function SubdeviceController() { return true; }
 export function Size() { return [8, 1]; }
 export function DefaultPosition() { return [0, 0]; }
 export function DefaultScale() { return 8.0; }
-export function ImageUrl() { return ""; }
+export function ImageUrl() { return "https://raw.githubusercontent.com/maihcx/AsiaHorse-Umbra-ARGB-Hub-SignalRGB-Plugin/main/Images/AsiaHorseUmbra.png"; }
 
 export function ControllableParameters() {
     return [];
@@ -123,12 +123,6 @@ function setupChannels() {
     for (let i = 1; i <= 10; i++) {
         const oldName = "ARGB Port " + i;
         const newName = "ARGB Port " + String(i).padStart(2, "0");
-
-        try {
-            device.removeChannel(oldName);
-        } catch (e) {
-            // Ignore channels that do not exist.
-        }
 
         try {
             device.removeChannel(newName);
