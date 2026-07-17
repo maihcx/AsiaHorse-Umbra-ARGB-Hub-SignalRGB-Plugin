@@ -13,19 +13,15 @@
  *   Request body: 01 FF
  *   Response: 01 FF + 10 records x 5 bytes
  *
- * Observed record layout:
+ * Observed topology record:
  *   [LED count] [unknown] [unknown] [port index] [unknown]
  *
- * Ports with no SignalRGB component configured are transmitted as black while
- * still reserving their controller-reported physical LED count in the Direct
- * RGB stream.
- *
- * No fixed per-port LED maximum is assumed. For populated ports, the
- * controller-reported LED count is used as the channel LedLimit. Empty ports
- * omit the optional limit because no grounded maximum is currently known.
+ * The controller-reported LED count determines each port's physical allocation
+ * in the Direct RGB stream. A populated port without a configured SignalRGB
+ * component is transmitted as black so later ports keep their correct offsets.
  */
 
-/* global debugLog */
+/* global autoDetectLedTrigger, bootEffectFixedMode, bootSelfCheck, debugLog, resetDeviceTrigger */
 
 export function Name() { return "AsiaHorse Umbra ARGB Hub"; }
 export function VendorId() { return 0x1A86; }
@@ -44,13 +40,43 @@ export function ImageUrl() {
 }
 
 export function ControllableParameters() {
-    return [{
-        property: "debugLog",
-        group: "lighting",
-        label: "Log protocol activity to console",
-        type: "boolean",
-        default: 0
-    }];
+    return [
+        {
+            property: "bootEffectFixedMode",
+            group: "lighting",
+            label: "Fixed Mode",
+            type: "boolean",
+            default: 0
+        },
+        {
+            property: "bootSelfCheck",
+            group: "lighting",
+            label: "Boot Self-Check",
+            type: "boolean",
+            default: 1
+        },
+        {
+            property: "autoDetectLedTrigger",
+            group: "lighting",
+            label: "Auto Detect LEDs — toggle to run",
+            type: "boolean",
+            default: 0
+        },
+        {
+            property: "resetDeviceTrigger",
+            group: "lighting",
+            label: "Reset Device — toggle to run",
+            type: "boolean",
+            default: 0
+        },
+        {
+            property: "debugLog",
+            group: "lighting",
+            label: "Log protocol activity to console",
+            type: "boolean",
+            default: 0
+        }
+    ];
 }
 
 const CHANNEL_COUNT = 10;
@@ -69,6 +95,23 @@ const NATIVE_HEADER_1 = 0x42;
 const DIRECT_RGB_HEADER = 0x88;
 const DIRECT_RGB_LEDS_PER_PACKET = 20;
 
+const BOOT_MODE_COMMAND = 0x0B;
+const BOOT_SELF_CHECK_COMMAND = 0x0C;
+
+const BOOT_MODE_MEMORY_VALUE = 0xFF;
+const BOOT_MODE_FIXED_VALUE = 0x01;
+const BOOT_SELF_CHECK_ENABLED_VALUE = 0xFF;
+const BOOT_SELF_CHECK_DISABLED_VALUE = 0x01;
+
+const STATUS_QUERY = [0x00];
+const STATUS_BOOT_MODE_OFFSET = 23;
+const STATUS_BOOT_SELF_CHECK_OFFSET = 24;
+const STATUS_CHECKSUM_OFFSET = 25;
+const STATUS_QUERY_ATTEMPTS = 3;
+const STATUS_QUERY_RETRY_DELAY_MS = 20;
+
+const RESET_DEVICE_COMMAND = [0xFA];
+const AUTO_DETECT_LED_COMMAND = [0xFC];
 const PORT_QUERY = [0x01, 0xFF];
 const PORT_RECORD_SIZE = 5;
 const PORT_RECORDS_OFFSET = 6;
@@ -78,11 +121,7 @@ const PORT_QUERY_RETRY_DELAY_MS = 20;
 const INITIALIZATION_RETRY_INTERVAL_MS = 2000;
 const DEBUG_FRAME_LOG_INTERVAL_MS = 5000;
 
-/*
- * Observed startup command from the official application.
- * It appears to correspond to 100% brightness, but that semantic is not yet
- * considered fully confirmed, so the protocol name stays neutral here.
- */
+/* Observed startup command; its exact semantic meaning is not confirmed. */
 const STARTUP_COMMAND_FB_64 = [0xFB, 0x64];
 
 /* Observed command used before continuous software-driven RGB streaming. */
@@ -97,6 +136,10 @@ let retryCount = 0;
 let nextRetryAt = 0;
 let nextFrameDebugLogAt = 0;
 
+let hubBootModeFixed = null;
+let hubBootSelfCheckEnabled = null;
+let syncingBootControls = false;
+
 export function Validate(endpoint) {
     return endpoint.interface === 0 &&
         endpoint.usage_page === 0xFF00 &&
@@ -108,8 +151,7 @@ export function LedPositions() { return []; }
 
 export function Initialize() {
     resetRetryState();
-    removeLegacyChannels();
-    attemptInitialization("startup");
+    attemptInitialization();
 }
 
 export function Render() {
@@ -129,8 +171,99 @@ export function Shutdown(/* SystemSuspending */) {
     // Preserve the last visible lighting state.
 }
 
+export function onbootEffectFixedModeChanged() {
+    const fixedModeEnabled = isControlEnabled(bootEffectFixedMode);
+
+    if (
+        syncingBootControls ||
+        hubBootModeFixed === fixedModeEnabled
+    ) {
+        return;
+    }
+
+    if (
+        sendBootMode(
+            fixedModeEnabled
+                ? BOOT_MODE_FIXED_VALUE
+                : BOOT_MODE_MEMORY_VALUE,
+            fixedModeEnabled
+                ? "Fixed Mode"
+                : "Memory Mode"
+        )
+    ) {
+        hubBootModeFixed = fixedModeEnabled;
+    }
+}
+
+export function onbootSelfCheckChanged() {
+    const enabled = isControlEnabled(bootSelfCheck);
+
+    if (
+        syncingBootControls ||
+        hubBootSelfCheckEnabled === enabled
+    ) {
+        return;
+    }
+
+    if (
+        sendManualNativeCommand(
+            [
+                BOOT_SELF_CHECK_COMMAND,
+                enabled
+                    ? BOOT_SELF_CHECK_ENABLED_VALUE
+                    : BOOT_SELF_CHECK_DISABLED_VALUE
+            ],
+            `Boot Self-Check ${enabled ? "enabled" : "disabled"}`
+        )
+    ) {
+        hubBootSelfCheckEnabled = enabled;
+    }
+}
+
+export function onautoDetectLedTriggerChanged() {
+    sendManualNativeCommand(
+        AUTO_DETECT_LED_COMMAND,
+        "Auto Detect LED command sent manually. " +
+        "The controller may temporarily disconnect while refreshing topology."
+    );
+}
+
+export function onresetDeviceTriggerChanged() {
+    sendManualNativeCommand(
+        RESET_DEVICE_COMMAND,
+        "Reset Device command sent manually. The controller may temporarily disconnect."
+    );
+}
+
 export function ondebugLogChanged() {
     logTopology();
+}
+
+function sendBootMode(value, label) {
+    return sendManualNativeCommand(
+        [BOOT_MODE_COMMAND, value],
+        `${label} selected`
+    );
+}
+
+function sendManualNativeCommand(command, successMessage) {
+    try {
+        sendNativeCommand(command);
+        device.log(`[AsiaHorse] ${successMessage}.`);
+        return true;
+    } catch (error) {
+        device.log(
+            `[AsiaHorse] Failed to send manual command.${formatErrorSuffix(error)}`
+        );
+        return false;
+    }
+}
+
+function isControlEnabled(value) {
+    return value === true ||
+        value === 1 ||
+        value === "1" ||
+        value === "true";
 }
 
 /* Hub initialization and topology */
@@ -148,10 +281,16 @@ function resetRetryState() {
     nextRetryAt = 0;
 }
 
-function attemptInitialization(trigger) {
+function attemptInitialization() {
+    const previousRetryCount = retryCount;
     resetRuntimeState();
 
     try {
+        if (!refreshBootControlsFromHub()) {
+            scheduleRetry("hub boot state could not be confirmed");
+            return false;
+        }
+
         if (!loadHubTopology()) {
             scheduleRetry("hub topology could not be confirmed");
             return false;
@@ -167,12 +306,11 @@ function attemptInitialization(trigger) {
             return false;
         }
 
-        const completedRetryCount = retryCount;
         resetRetryState();
 
-        if (isDebugLoggingEnabled() && trigger === "retry") {
+        if (isDebugLoggingEnabled() && previousRetryCount > 0) {
             device.log(
-                `[AsiaHorse] Retry succeeded after ${completedRetryCount} failed attempt(s).`
+                `[AsiaHorse] Retry succeeded after ${previousRetryCount} failed attempt(s).`
             );
         }
 
@@ -192,7 +330,7 @@ function retryInitializationIfDue() {
         return;
     }
 
-    attemptInitialization("retry");
+    attemptInitialization();
 }
 
 function scheduleRetry(reason, error) {
@@ -210,6 +348,112 @@ function scheduleRetry(reason, error) {
 function scheduleFullRetry(reason, error) {
     resetRuntimeState();
     scheduleRetry(reason, error);
+}
+
+function refreshBootControlsFromHub() {
+    const status = queryHubStatus();
+
+    if (!status) {
+        return false;
+    }
+
+    hubBootModeFixed = status.fixedMode;
+    hubBootSelfCheckEnabled = status.selfCheckEnabled;
+
+    syncingBootControls = true;
+
+    try {
+        bootEffectFixedMode = status.fixedMode;
+        bootSelfCheck = status.selfCheckEnabled;
+    } finally {
+        syncingBootControls = false;
+    }
+
+    if (isDebugLoggingEnabled()) {
+        device.log(
+            `[AsiaHorse] Boot state: mode=${status.fixedMode ? "Fixed" : "Memory"} ` +
+            `selfCheck=${status.selfCheckEnabled ? "On" : "Off"}`
+        );
+    }
+
+    return true;
+}
+
+function queryHubStatus() {
+    for (let attempt = 0; attempt < STATUS_QUERY_ATTEMPTS; attempt++) {
+        try {
+            clearReadBuffer();
+            sendNativeCommand(STATUS_QUERY);
+            device.pause(2);
+
+            const response = device.read(
+                [HID_REPORT_ID],
+                HID_REPORT_SIZE,
+                100
+            ) || [];
+
+            const status = parseHubStatus(response);
+            if (status) {
+                return status;
+            }
+        } catch (error) {
+            if (isDebugLoggingEnabled()) {
+                device.log(
+                    `[AsiaHorse] Status read attempt ${attempt + 1}/` +
+                    `${STATUS_QUERY_ATTEMPTS} failed.${formatErrorSuffix(error)}`
+                );
+            }
+        }
+
+        if (attempt + 1 < STATUS_QUERY_ATTEMPTS) {
+            device.pause(STATUS_QUERY_RETRY_DELAY_MS);
+        }
+    }
+
+    return null;
+}
+
+function parseHubStatus(data) {
+    const packetStart = findNativeResponse(data, STATUS_QUERY);
+    if (packetStart < 0) {
+        return null;
+    }
+
+    const bootModeOffset = packetStart + STATUS_BOOT_MODE_OFFSET;
+    const selfCheckOffset = packetStart + STATUS_BOOT_SELF_CHECK_OFFSET;
+    const checksumOffset = packetStart + STATUS_CHECKSUM_OFFSET;
+
+    if (checksumOffset >= data.length) {
+        return null;
+    }
+
+    const expectedChecksum = checksumRange(data, packetStart, checksumOffset);
+    if (expectedChecksum !== clampByte(data[checksumOffset])) {
+        return null;
+    }
+
+    const bootModeValue = clampByte(data[bootModeOffset]);
+    const selfCheckValue = clampByte(data[selfCheckOffset]);
+
+    if (
+        bootModeValue !== BOOT_MODE_MEMORY_VALUE &&
+        bootModeValue !== BOOT_MODE_FIXED_VALUE
+    ) {
+        return null;
+    }
+
+    if (
+        selfCheckValue !== BOOT_SELF_CHECK_ENABLED_VALUE &&
+        selfCheckValue !== BOOT_SELF_CHECK_DISABLED_VALUE
+    ) {
+        return null;
+    }
+
+    return {
+        fixedMode: bootModeValue === BOOT_MODE_FIXED_VALUE,
+        selfCheckEnabled:
+            selfCheckValue === BOOT_SELF_CHECK_ENABLED_VALUE
+    };
 }
 
 function loadHubTopology() {
@@ -300,27 +544,26 @@ function setupChannels() {
         return false;
     }
 
-    /*
-     * This is the controller's currently detected physical LED capacity, not a
-     * claimed hardware maximum. It keeps SignalRGB's aggregate limit aligned
-     * with the topology we can actually address in the current Direct RGB
-     * stream.
-     */
-    device.SetLedLimit(getTotalLedCount());
+    const detectedTotalLedCount = getTotalLedCount();
+    if (detectedTotalLedCount > 0) {
+        device.SetLedLimit(detectedTotalLedCount);
+    }
 
     for (let portIndex = 0; portIndex < CHANNEL_COUNT; portIndex++) {
         const name = CHANNEL_NAMES[portIndex];
+        const detectedPortLedCount = hubPorts[portIndex].ledCount;
+        const channel = device.channel(name);
 
-        /*
-         * Do not remove and recreate current channels during normal startup.
-         * Existing channels can carry the user's configured components and
-         * SignalRGB already cleans channels up on a normal shutdown.
-         */
-        if (device.channel(name)) {
+        if (channel) {
+            if (
+                detectedPortLedCount > 0 &&
+                typeof channel.SetLedLimit === "function"
+            ) {
+                channel.SetLedLimit(detectedPortLedCount);
+            }
+
             continue;
         }
-
-        const detectedPortLedCount = hubPorts[portIndex].ledCount;
 
         if (detectedPortLedCount > 0) {
             device.addChannel(name, detectedPortLedCount);
@@ -331,27 +574,6 @@ function setupChannels() {
 
     channelsReady = CHANNEL_NAMES.every(name => Boolean(device.channel(name)));
     return channelsReady;
-}
-
-function removeLegacyChannels() {
-    for (let index = 0; index < CHANNEL_COUNT; index++) {
-        const legacyName = `ARGB Port ${index + 1}`;
-        const currentName = CHANNEL_NAMES[index];
-
-        if (legacyName !== currentName) {
-            removeChannelIfPresent(legacyName);
-        }
-    }
-}
-
-function removeChannelIfPresent(name) {
-    try {
-        if (device.channel(name)) {
-            device.removeChannel(name);
-        }
-    } catch (error) {
-        // Ignore missing or stale development channels.
-    }
 }
 
 function enableSoftwareControl() {
@@ -389,12 +611,12 @@ function sendDirectRgbFrame() {
     const frameSlotCount = packetCount * DIRECT_RGB_LEDS_PER_PACKET;
     const frame = buildFrame(frameSlotCount);
 
-    for (let packet = 0; packet < packetCount; packet++) {
-        const start = packet * DIRECT_RGB_LEDS_PER_PACKET;
+    for (let packetIndex = 0; packetIndex < packetCount; packetIndex++) {
+        const start = packetIndex * DIRECT_RGB_LEDS_PER_PACKET;
 
         sendDirectRgbPacket(
             packetCount,
-            packet + 1,
+            packetIndex + 1,
             frame.slice(start, start + DIRECT_RGB_LEDS_PER_PACKET)
         );
     }
@@ -455,17 +677,17 @@ function resampleChannel(channel, sourceLedCount, targetLedCount) {
 
     const colors = new Array(targetLedCount);
 
-    for (let target = 0; target < targetLedCount; target++) {
-        const source = mapSampleIndex(
-            target,
+    for (let targetIndex = 0; targetIndex < targetLedCount; targetIndex++) {
+        const sourceIndex = mapSampleIndex(
+            targetIndex,
             targetLedCount,
             availableSourceCount
         );
 
-        colors[target] = [
-            clampByte(red[source]),
-            clampByte(green[source]),
-            clampByte(blue[source])
+        colors[targetIndex] = [
+            clampByte(red[sourceIndex]),
+            clampByte(green[sourceIndex]),
+            clampByte(blue[sourceIndex])
         ];
     }
 
@@ -489,8 +711,8 @@ function sendDirectRgbPacket(packetCount, packetIndex, colors) {
         packetIndex & 0xFF
     ];
 
-    for (let led = 0; led < DIRECT_RGB_LEDS_PER_PACKET; led++) {
-        const color = colors[led] || [0, 0, 0];
+    for (let ledIndex = 0; ledIndex < DIRECT_RGB_LEDS_PER_PACKET; ledIndex++) {
+        const color = colors[ledIndex] || [0, 0, 0];
 
         packet.push(
             clampByte(color[0]),
@@ -625,22 +847,47 @@ function appendColors(target, colors) {
 }
 
 function findNativeResponse(data, command) {
-    if (!data || !command || command.length < 2) {
+    if (!data || !command || command.length <= 0) {
         return -1;
     }
 
-    for (let start = 0; start + 5 < data.length; start++) {
+    for (
+        let start = 0;
+        start + 4 + command.length <= data.length;
+        start++
+    ) {
         if (
-            data[start] === NATIVE_HEADER_0 &&
-            data[start + 1] === NATIVE_HEADER_1 &&
-            data[start + 4] === command[0] &&
-            data[start + 5] === command[1]
+            data[start] !== NATIVE_HEADER_0 ||
+            data[start + 1] !== NATIVE_HEADER_1
         ) {
+            continue;
+        }
+
+        let matches = true;
+
+        for (let index = 0; index < command.length; index++) {
+            if (data[start + 4 + index] !== command[index]) {
+                matches = false;
+                break;
+            }
+        }
+
+        if (matches) {
             return start;
         }
     }
 
     return -1;
+}
+
+function checksumRange(bytes, start, endExclusive) {
+    let sum = 0;
+
+    for (let index = start; index < endExclusive; index++) {
+        sum = (sum + (bytes[index] & 0xFF)) & 0xFF;
+    }
+
+    return sum;
 }
 
 function checksum(bytes) {
