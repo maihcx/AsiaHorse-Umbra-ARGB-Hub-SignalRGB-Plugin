@@ -19,6 +19,21 @@
  * The controller-reported LED count determines each port's physical allocation
  * in the Direct RGB stream. A populated port without a configured SignalRGB
  * component is transmitted as black so later ports keep their correct offsets.
+ *
+ * --- Corrections (cross-checked against a decompiled vendor app, Sync_light.py,
+ *     via a sibling "PWM Hub" plugin build on the same VID/PID) ---
+ *   - 0xFC is NOT an "auto detect LEDs" command. Decompiled source names it
+ *     argb_fan_save - it SAVES CURRENT STATE TO FLASH AND REBOOTS the
+ *     controller. The real auto-detect command is 0x07 (argb_auto_rgb_num).
+ *     Updated below.
+ *   - 0xFB is NOT a generic "startup" command. Decompiled source names it
+ *     ARGB_pwm_speed - it sets FAN PWM SPEED. The previous `FB 64` sent on
+ *     every Initialize() risked silently overriding the user's fan curve on
+ *     every plugin load. It has been removed; software control is enabled
+ *     with FD 01 alone, matching what streaming actually requires.
+ *   - 0xFA (reset) and 0x0B/0x0C (boot mode / self-check) do not appear in
+ *     the decompiled command table seen so far, so they remain unverified
+ *     against that source (not necessarily wrong - just not yet confirmed).
  */
 
 /* global autoDetectLedTrigger, bootEffectFixedMode, bootSelfCheck, debugLog, resetDeviceTrigger */
@@ -110,8 +125,10 @@ const STATUS_CHECKSUM_OFFSET = 25;
 const STATUS_QUERY_ATTEMPTS = 3;
 const STATUS_QUERY_RETRY_DELAY_MS = 20;
 
-const RESET_DEVICE_COMMAND = [0xFA];
-const AUTO_DETECT_LED_COMMAND = [0xFC];
+const RESET_DEVICE_COMMAND = [0xFA]; // Unverified against decompiled vendor source - use with caution.
+const AUTO_DETECT_LED_COMMAND = [0x07]; // argb_auto_rgb_num per decompiled vendor source.
+                                         // Was 0xFC, which is actually argb_fan_save
+                                         // (save-to-flash + REBOOT) and unrelated to LED detection.
 const PORT_QUERY = [0x01, 0xFF];
 const PORT_RECORD_SIZE = 5;
 const PORT_RECORDS_OFFSET = 6;
@@ -121,7 +138,15 @@ const PORT_QUERY_RETRY_DELAY_MS = 20;
 const INITIALIZATION_RETRY_INTERVAL_MS = 2000;
 const DEBUG_FRAME_LOG_INTERVAL_MS = 5000;
 
-/* Observed startup command; its exact semantic meaning is not confirmed. */
+// Sustained write-rate ceiling. The vendor app was measured (via capture)
+// sustaining ~378 writes/sec continuously; we pace a bit under that so we
+// never outrun what the hub's HID stack has been proven to handle.
+const TARGET_WRITES_PER_SEC = 330;
+
+/* Formerly sent unconditionally on every Initialize() as an "observed
+ * startup command of unconfirmed meaning". Decompiled vendor source
+ * identifies 0xFB as ARGB_pwm_speed (fan PWM speed control) - kept here
+ * only for reference, deliberately NOT sent (see enableSoftwareControl). */
 const STARTUP_COMMAND_FB_64 = [0xFB, 0x64];
 
 /* Observed command used before continuous software-driven RGB streaming. */
@@ -135,6 +160,9 @@ let softwareControlReady = false;
 let retryCount = 0;
 let nextRetryAt = 0;
 let nextFrameDebugLogAt = 0;
+
+let lastFrameTime = 0;
+let frameIntervalMs = 0;
 
 let hubBootModeFixed = null;
 let hubBootSelfCheckEnabled = null;
@@ -159,6 +187,12 @@ export function Render() {
         retryInitializationIfDue();
         return;
     }
+
+    const now = Date.now();
+    if (frameIntervalMs > 0 && now - lastFrameTime < frameIntervalMs) {
+        return;
+    }
+    lastFrameTime = now;
 
     try {
         sendDirectRgbFrame();
@@ -223,7 +257,7 @@ export function onbootSelfCheckChanged() {
 export function onautoDetectLedTriggerChanged() {
     sendManualNativeCommand(
         AUTO_DETECT_LED_COMMAND,
-        "Auto Detect LED command sent manually. " +
+        "Auto Detect LED command (0x07) sent manually. " +
         "The controller may temporarily disconnect while refreshing topology."
     );
 }
@@ -274,6 +308,8 @@ function resetRuntimeState() {
     channelsReady = false;
     softwareControlReady = false;
     nextFrameDebugLogAt = 0;
+    lastFrameTime = 0;
+    frameIntervalMs = 0;
 }
 
 function resetRetryState() {
@@ -549,6 +585,14 @@ function setupChannels() {
         device.SetLedLimit(detectedTotalLedCount);
     }
 
+    const packetCount = detectedTotalLedCount > 0
+        ? Math.ceil(detectedTotalLedCount / DIRECT_RGB_LEDS_PER_PACKET)
+        : 0;
+    frameIntervalMs = packetCount > 0
+        ? Math.ceil((packetCount * 1000) / TARGET_WRITES_PER_SEC)
+        : 0;
+    lastFrameTime = 0;
+
     for (let portIndex = 0; portIndex < CHANNEL_COUNT; portIndex++) {
         const name = CHANNEL_NAMES[portIndex];
         const detectedPortLedCount = hubPorts[portIndex].ledCount;
@@ -581,9 +625,8 @@ function enableSoftwareControl() {
         return false;
     }
 
-    sendNativeCommand(STARTUP_COMMAND_FB_64);
-    device.pause(10);
-
+    // Only the documented control-handover command is sent. The previous
+    // FB 64 write is intentionally skipped - see STARTUP_COMMAND_FB_64.
     sendNativeCommand(SOFTWARE_CONTROL_COMMAND);
     device.pause(2);
 
