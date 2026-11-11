@@ -1,7 +1,7 @@
 /*
  * AsiaHorse Umbra / ROBOBLOQ USBFAN - SignalRGB plugin
  * USB VID: 0x1A86
- * USB PID: 0xFE05
+ * USB PID: 0xFE04
  *
  * Native command:
  *   52 42 [length] 00 [body...] [checksum]
@@ -45,7 +45,7 @@
 
 export function Name() { return "AsiaHorse Umbra ARGB Hub"; }
 export function VendorId() { return 0x1A86; }
-export function ProductId() { return 0xFE05; }
+export function ProductId() { return 0xFE04; } // Umbra Hub v2 uses 0xFE04 instead of 0xFE05 (v1)
 export function Publisher() { return "Huynh Mai"; }
 export function Documentation() { return "troubleshooting/other"; }
 export function Type() { return "hid"; }
