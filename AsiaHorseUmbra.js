@@ -1,7 +1,7 @@
 /*
  * AsiaHorse Umbra / ROBOBLOQ USBFAN - SignalRGB plugin
  * USB VID: 0x1A86
- * USB PID: 0xFE05
+ * USB PID: 0xFE04
  *
  * Native command:
  *   52 42 [length] 00 [body...] [checksum]
@@ -14,7 +14,12 @@
  *   Response: 01 FF + 10 records x 5 bytes
  *
  * Observed topology record:
- *   [LED count] [unknown] [unknown] [port index] [unknown]
+ *   [LED count] [unknown] [unknown] [boot animation rank] [unknown]
+ *
+ * Records arrive in physical port order (record 0 = port 1). Byte 3 is NOT the
+ * port index but the position the port has in the software's boot animation
+ * order. The hub consumes the Direct RGB stream in physical port order, so the
+ * record position is used as the channel index and byte 3 is only logged.
  *
  * The controller-reported LED count determines each port's physical allocation
  * in the Direct RGB stream. A populated port without a configured SignalRGB
@@ -40,7 +45,7 @@
 
 export function Name() { return "AsiaHorse Umbra ARGB Hub"; }
 export function VendorId() { return 0x1A86; }
-export function ProductId() { return 0xFE05; }
+export function ProductId() { return 0xFE04; } // Umbra Hub v2 uses 0xFE04 instead of 0xFE05 (v1)
 export function Publisher() { return "Huynh Mai"; }
 export function Documentation() { return "troubleshooting/other"; }
 export function Type() { return "hid"; }
@@ -559,15 +564,12 @@ function parsePortTopology(data) {
             ledCount: clampByte(data[offset]),
             field1: clampByte(data[offset + 1]),
             field2: clampByte(data[offset + 2]),
-            index: clampByte(data[offset + 3]),
+            index: record,
+            rank: clampByte(data[offset + 3]),
             field4: clampByte(data[offset + 4])
         };
 
-        if (port.index >= CHANNEL_COUNT || ports[port.index] !== null) {
-            return null;
-        }
-
-        ports[port.index] = port;
+        ports[record] = port;
     }
 
     return ports.every(port => port !== null) ? ports : null;
@@ -845,6 +847,7 @@ function createEmptyPortTable() {
         field1: 0,
         field2: 0,
         index,
+        rank: index,
         field4: 0
     }));
 }
@@ -862,7 +865,7 @@ function logTopology() {
     for (const port of hubPorts) {
         device.log(
             `[AsiaHorse] Port ${String(port.index + 1).padStart(2, "0")}: ` +
-            `LEDs=${port.ledCount} field1=${port.field1} ` +
+            `LEDs=${port.ledCount} bootRank=${port.rank + 1} field1=${port.field1} ` +
             `field2=${port.field2} field4=${port.field4}`
         );
     }
